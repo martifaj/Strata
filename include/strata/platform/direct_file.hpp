@@ -20,6 +20,13 @@ struct Completion {
     bool ok = false;
 };
 
+struct ReadRequest {
+    uint64_t offset = 0;
+    void* buffer = nullptr;
+    uint32_t length = 0;
+    uint64_t tag = 0;
+};
+
 class DirectFile {
 public:
     DirectFile();
@@ -36,6 +43,9 @@ public:
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request
     /// always produces exactly one completion.
     bool submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err);
+
+    /// Queue `n` reads in one batch. Returns false (and sets `err`) without queueing any if a request is invalid.
+    bool submit_batch(const ReadRequest* reqs, size_t n, std::string& err);
 
     /// Wait for up to `max` completions; returns how many were written to `out`. `timeout_ms` < 0 waits
     /// forever; 0 polls. A `wake()` shows up as one completion with tag `WAKE_TAG`.
