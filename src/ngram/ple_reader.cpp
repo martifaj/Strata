@@ -6,7 +6,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <mutex>
 #include <thread>
@@ -77,13 +76,81 @@ struct Use {
     uint8_t* dst;
 };
 
+/// Almost every read serves 1..4 rows on that page; keeping those inline avoids a heap allocation per distinct page.
+struct UseList {
+    static constexpr uint32_t INLINE = 4;
+    uint32_t n = 0;
+    Use local[INLINE];
+    std::vector<Use> heap;
+
+    const Use* begin() const { return n <= INLINE ? local : heap.data(); }
+    const Use* end() const { return begin() + n; }
+    void clear() {
+        n = 0;
+        if (!heap.empty()) std::vector<Use>().swap(heap);
+    }
+    void push_back(const Use& u) {
+        if (n < INLINE) { local[n++] = u; return; }
+        if (n == INLINE) { heap.reserve(8); heap.assign(local, local + INLINE); }
+        heap.push_back(u);
+        ++n;
+    }
+};
+
 struct Job {
     uint64_t offset = 0;   // aligned file offset
     uint32_t length = 0;   // PAGE or 2 * PAGE (a row that straddles a page boundary)
     uint32_t ticket = 0;
-    std::vector<Use> uses;
+    UseList uses;
     double issued_us = 0;
     bool keepalive = false;// no rows and no ticket: it only keeps the SSD awake (`set_keepalive`)
+};
+
+/// Power-of-two ring buffer of unsubmitted jobs (std::deque allocates and frees a 512 B block every ~9 jobs).
+struct JobQueue {
+    std::vector<Job> buf;
+    size_t head = 0, count = 0;
+
+    void init(size_t cap) {
+        size_t p = 64;
+        while (p < cap) p <<= 1;
+        buf.assign(p, Job{});
+        head = count = 0;
+    }
+    bool empty() const { return count == 0; }
+    Job& front() { return buf[head]; }
+    void pop_front() {
+        buf[head].uses.clear();
+        head = (head + 1) & (buf.size() - 1);
+        --count;
+    }
+    Job& emplace_back() {
+        if (count == buf.size()) grow();
+        Job& j = buf[(head + count++) & (buf.size() - 1)];
+        j.offset = 0;
+        j.length = 0;
+        j.ticket = 0;
+        j.uses.clear();
+        j.issued_us = 0;
+        j.keepalive = false;
+        return j;
+    }
+    void push_back(Job&& j) {
+        if (count == buf.size()) grow();
+        buf[(head + count++) & (buf.size() - 1)] = std::move(j);
+    }
+    void grow() {
+        std::vector<Job> next(buf.empty() ? 64 : buf.size() * 2);
+        for (size_t i = 0; i < count; ++i)
+            next[i] = std::move(buf[(head + i) & (buf.size() - 1)]);
+        buf = std::move(next);
+        head = 0;
+    }
+    void clear() {
+        for (size_t i = 0; i < count; ++i)
+            buf[(head + i) & (buf.size() - 1)].uses.clear();
+        head = count = 0;
+    }
 };
 
 struct Miss {
@@ -96,6 +163,7 @@ struct Miss {
 };
 
 struct TicketState {
+    uint32_t id = 0;
     uint32_t pending = 0;  // jobs not yet completed
 };
 
@@ -115,8 +183,8 @@ struct PleReader::Impl {
     std::vector<uint32_t> free_slots;
     std::vector<Job> inflight;            // indexed by slot
     std::vector<Completion> delayed;      // completed but held back by fault injection
-    std::deque<Job> queue;                // not yet submitted
-    std::unordered_map<uint32_t, TicketState> tickets;
+    JobQueue queue;                       // not yet submitted
+    std::vector<TicketState> tickets;     // active tickets in flight (typically 1..8)
     uint32_t next_ticket = 1;
     RowCache cache;
     ReaderStats stats;
@@ -132,6 +200,7 @@ struct PleReader::Impl {
 
     bool threaded = false;
     bool stop = false;
+    bool in_file_wait = false;            // true while worker_loop is blocked inside file.wait()
     std::mutex mu;
     std::condition_variable cv_work;      // worker: there is something to submit
     std::condition_variable cv_done;      // collectors: a ticket may have completed
@@ -140,11 +209,22 @@ struct PleReader::Impl {
     uint8_t* slot_buf(uint32_t s) { return slab + (size_t) s * 2 * PAGE; }
     bool busy() const { return free_slots.size() < max_inflight || !delayed.empty(); }
 
+    TicketState* find_ticket(uint32_t id) {
+        for (TicketState& t : tickets)
+            if (t.id == id) return &t;
+        return nullptr;
+    }
+    void dec_ticket(uint32_t id) {
+        if (TicketState* t = find_ticket(id); t && t->pending > 0) --t->pending;
+    }
+    void erase_ticket(TicketState* t) {
+        *t = tickets.back();
+        tickets.pop_back();
+    }
+
     void cancel_queued() {
-        for (const Job& job : queue) {
-            auto it = tickets.find(job.ticket);
-            if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
-        }
+        for (size_t i = 0; i < queue.count; ++i)
+            dec_ticket(queue.buf[(queue.head + i) & (queue.buf.size() - 1)].ticket);
         queue.clear();
     }
 
@@ -158,7 +238,7 @@ struct PleReader::Impl {
         while (!queue.empty() && !free_slots.empty()) {
             const uint32_t s = free_slots.back();
             free_slots.pop_back();
-            inflight[s] = std::move(queue.front());
+            std::swap(inflight[s], queue.front());
             queue.pop_front();
             Job& j = inflight[s];
             j.issued_us = now_us();
@@ -171,8 +251,7 @@ struct PleReader::Impl {
                     continue;
                 }
                 j.uses.clear();
-                auto it = tickets.find(j.ticket);
-                if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+                dec_ticket(j.ticket);
                 free_slots.push_back(s);
                 cancel_queued();
                 return false;
@@ -199,11 +278,10 @@ struct PleReader::Impl {
         rng ^= rng >> 7;
         rng ^= rng << 17;
         const uint64_t first = table_offset / PAGE, end = (table_offset + n_rows * (uint64_t) row_bytes) / PAGE;
-        Job j;
+        Job& j = queue.emplace_back();
         j.offset = (first + (end > first ? rng % (end - first) : 0)) * PAGE;
         j.length = PAGE;
         j.keepalive = true;
-        queue.push_back(std::move(j));
     }
 
     bool finish(const Completion& c) {
@@ -229,8 +307,7 @@ struct PleReader::Impl {
             error = "PleReader: a table read failed";
             cancel_queued();
             j.uses.clear();
-            auto it = tickets.find(j.ticket);
-            if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+            dec_ticket(j.ticket);
             free_slots.push_back(s);
             return false;
         }
@@ -242,8 +319,7 @@ struct PleReader::Impl {
                 error = "PleReader: short read inside the table";
                 cancel_queued();
                 j.uses.clear();
-                auto it = tickets.find(j.ticket);
-                if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+                dec_ticket(j.ticket);
                 free_slots.push_back(s);
                 return false;
             }
@@ -252,8 +328,7 @@ struct PleReader::Impl {
             std::memcpy(u.dst, buf + u.in_page, row_bytes);
             cache.insert(u.row, buf + u.in_page);
         }
-        auto it = tickets.find(j.ticket);
-        if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+        dec_ticket(j.ticket);
         j.uses.clear();
         free_slots.push_back(s);
         return error.empty() ? pump() : true;
@@ -326,10 +401,12 @@ struct PleReader::Impl {
             if (!busy()) { cv_done.notify_all(); continue; }
             // Block in the port WITHOUT the lock, so `issue` can queue work; `issue` wakes us with a packet.
             const int timeout = delayed.empty() ? -1 : 0;
+            in_file_wait = true;
             lk.unlock();
             Completion got[64];
             const int n = file.wait(got, 64, timeout);
             lk.lock();
+            in_file_wait = false;
             if (!process(got, n) && error.empty()) error = "PleReader: read failed";
             cv_done.notify_all();
         }
@@ -362,6 +439,9 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     impl_->inflight.assign(max_inflight, Job{});
     impl_->free_slots.clear();
     for (uint32_t s = max_inflight; s-- > 0;) impl_->free_slots.push_back(s);
+    impl_->queue.init(std::max<size_t>(128, (size_t) max_inflight * 2));
+    impl_->tickets.clear();
+    impl_->tickets.reserve(64);
     impl_->cache.init(cache_rows, row_bytes);
     impl_->error.clear();
     impl_->keep_us = 0;
@@ -370,6 +450,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     if (impl_->rng == 0) impl_->rng = 1;
     reset_stats();
     impl_->stop = false;
+    impl_->in_file_wait = false;
     impl_->threaded = io_thread;
     if (io_thread) {
         try {
@@ -413,7 +494,8 @@ void PleReader::close() {
     m.file.close();
     DirectFile::free_aligned(m.slab);
     m.slab = nullptr;
-    m.queue.clear();
+    m.queue.buf.clear();
+    m.queue.head = m.queue.count = 0;
     m.tickets.clear();
     m.delayed.clear();
     m.inflight.clear();
@@ -421,6 +503,7 @@ void PleReader::close() {
     m.cache.init(0);
     m.threaded = false;
     m.stop = false;
+    m.in_file_wait = false;
     m.keep_us = 0;
     m.last_issue_us = m.last_read_us = 0;
 }
@@ -437,12 +520,11 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     const double now = now_us();
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
-    TicketState& ts = m.tickets[id];
     // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
     // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
     // is not queued: it has no jobs, and `collect` returns the error at once.
     if (!m.error.empty()) {
-        ts.pending = 0;
+        m.tickets.push_back(TicketState{id, 0});
         return Ticket{id};
     }
     // The common batches -- a decode step's 1..16 rows, the prefetch of PLE_N_HEADS = 16 -- are folded in a fixed stack
@@ -453,7 +535,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     // share no scratch.
     if (n > UINT32_MAX) {
         m.error = "PleReader: more than 2^32 rows in one issue";
-        ts.pending = 0;
+        m.tickets.push_back(TicketState{id, 0});
         return Ticket{id};
     }
     constexpr size_t kStackMisses = 64;
@@ -494,13 +576,11 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
                 ++m.stats.dedup_rows;
                 ++end;
             }
-            Job j;
+            Job& j = m.queue.emplace_back();
             j.offset = first;
             j.length = length;
             j.ticket = id;
-            j.uses.reserve(end - k);
             for (; k < end; ++k) j.uses.push_back(Use{misses[k].row, misses[k].in_page, misses[k].dst});
-            m.queue.push_back(std::move(j));
             ++n_jobs;
         }
     } else {
@@ -543,13 +623,14 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
         n_jobs = (uint32_t) jobs.size();
         for (Job& j : jobs) m.queue.push_back(std::move(j));
     }
-    ts.pending = n_jobs;
-    const bool has_jobs = ts.pending > 0;
+    m.tickets.push_back(TicketState{id, n_jobs});
+    const bool has_jobs = n_jobs > 0;
     if (m.threaded) {
+        const bool wake_file = has_jobs && m.in_file_wait;
         lk.unlock();
         if (has_jobs) {
             m.cv_work.notify_one();
-            m.file.wake();                         // in case the worker is blocked in the port
+            if (wake_file) m.file.wake();          // only when the worker is blocked in `file.wait`
         } else if (rearm) {
             m.cv_work.notify_one();                // the keep-alive had lapsed: start it again
         }
@@ -564,30 +645,30 @@ bool PleReader::collect(Ticket t, std::string& err) {
     const double start = now_us();
     if (m.threaded) {
         std::unique_lock<std::mutex> lk(m.mu);
-        auto it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
+        TicketState* ts = m.find_ticket(t.id);
+        if (ts == nullptr) { err = "PleReader: unknown ticket"; return false; }
         m.cv_done.wait(lk, [&] {
-            const auto current = m.tickets.find(t.id);
-            return current == m.tickets.end() || current->second.pending == 0;
+            const TicketState* cur = m.find_ticket(t.id);
+            return cur == nullptr || cur->pending == 0;
         });
-        it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+        ts = m.find_ticket(t.id);
+        if (ts == nullptr) { err = "PleReader: unknown ticket"; return false; }
+        if (!m.error.empty()) { err = m.error; m.erase_ticket(ts); return false; }
         m.stats.wait_us += now_us() - start;
-        m.tickets.erase(it);
+        m.erase_ticket(ts);
         return true;
     }
-    auto it = m.tickets.find(t.id);
-    if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-    while (it->second.pending > 0) {
+    TicketState* ts = m.find_ticket(t.id);
+    if (ts == nullptr) { err = "PleReader: unknown ticket"; return false; }
+    while (ts->pending > 0) {
         const bool drained = m.drain(-1);
         if (!drained && m.error.empty()) m.error = "PleReader: read failed";
-        it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
+        ts = m.find_ticket(t.id);
+        if (ts == nullptr) { err = "PleReader: unknown ticket"; return false; }
     }
-    if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+    if (!m.error.empty()) { err = m.error; m.erase_ticket(ts); return false; }
     m.stats.wait_us += now_us() - start;
-    m.tickets.erase(it);
+    m.erase_ticket(ts);
     return true;
 }
 
